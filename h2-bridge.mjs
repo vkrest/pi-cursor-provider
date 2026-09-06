@@ -92,13 +92,41 @@ const ACTIVITY_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_ACTIVITY_TIMEO
 const H2_PING_INTERVAL_MS = parseInt(process.env.PI_CURSOR_BRIDGE_PING_INTERVAL_MS ?? "") || 15_000;
 const H2_PING_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_PING_TIMEOUT_MS ?? "") || 10_000;
 
-const client = http2.connect(url || "https://api2.cursor.sh", {
-  // Detect dead TCP connections at the HTTP/2 level — without this, a silently
-  // dropped connection (NAT timeout, LB cycling) can leave the bridge waiting
-  // for up to ACTIVITY_TIMEOUT_MS (5 min) with no indication of failure.
-  pingInterval: H2_PING_INTERVAL_MS,
-  pingTimeout: H2_PING_TIMEOUT_MS,
+const client = http2.connect(url || "https://api2.cursor.sh");
+let pingInterval;
+let pingTimeout;
+
+function stopPings() {
+  clearInterval(pingInterval);
+  clearTimeout(pingTimeout);
+  pingInterval = undefined;
+  pingTimeout = undefined;
+}
+
+// Node does not implement pingInterval/pingTimeout connection options.
+// Schedule actual HTTP/2 PING frames and require acknowledgement instead.
+client.once("connect", () => {
+  pingInterval = setInterval(() => {
+    if (client.closed || client.destroyed || pingTimeout) return;
+    pingTimeout = setTimeout(killBridge, H2_PING_TIMEOUT_MS);
+    pingTimeout.unref();
+    try {
+      const accepted = client.ping((error) => {
+        clearTimeout(pingTimeout);
+        pingTimeout = undefined;
+        if (error && !client.closed && !client.destroyed) killBridge();
+      });
+      if (!accepted) {
+        clearTimeout(pingTimeout);
+        pingTimeout = undefined;
+      }
+    } catch {
+      killBridge();
+    }
+  }, H2_PING_INTERVAL_MS);
+  pingInterval.unref();
 });
+client.once("close", stopPings);
 
 let timeout = setTimeout(killBridge, INITIAL_TIMEOUT_MS);
 
@@ -108,6 +136,7 @@ function resetTimeout() {
 }
 
 function killBridge() {
+  stopPings();
   clearTimeout(timeout);
   process.stderr.write(JSON.stringify({ type: "exit_reason", reason: "timeout" }) + "\n");
   client.destroy();
@@ -115,6 +144,7 @@ function killBridge() {
 }
 
 client.on("error", () => {
+  stopPings();
   clearTimeout(timeout);
   process.stderr.write(JSON.stringify({ type: "exit_reason", reason: "connection_error" }) + "\n");
   process.exit(1);
@@ -157,6 +187,7 @@ h2Stream.on("data", (chunk) => {
 });
 
 h2Stream.on("end", () => {
+  stopPings();
   clearTimeout(timeout);
   client.close();
   // Give stdout time to flush
@@ -164,6 +195,7 @@ h2Stream.on("end", () => {
 });
 
 h2Stream.on("error", () => {
+  stopPings();
   clearTimeout(timeout);
   process.stderr.write(JSON.stringify({ type: "exit_reason", reason: "stream_error" }) + "\n");
   client.close();

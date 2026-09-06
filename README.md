@@ -3,7 +3,7 @@
 **This fork improves on the upstream across six areas:**
 
 - **Image support** — base64 `image_url` content parts forwarded to Cursor end-to-end; the upstream silently drops them
-- **Compaction support** — old turns archived as inline text to cut `getBlobArgs` round-trips from O(history) to O(tail); bridge termination errors surface as real failures instead of silent empty responses; checkpoint cleared after compaction to keep both sides in sync
+* **Compaction support:** old turns archived as inline text to reduce blob retrieval work; bridge termination errors surface as failures instead of silent empty responses; server checkpoints preserved across Pi compaction
 - **Reliability** — transparent retry for transient Cursor protocol errors (internal / unavailable / deadline_exceeded); HTTP/2 PING keepalive detects dead connections; stall timer kills stuck bridges; bridge timeouts hardened and configurable; SSE keepalive prevents pi from timing out during blob-fetching; conversation state and checkpoints survive transient failures and client disconnects
 - **Model support** — per-model context window inference (vs. hardcoded 200 k); runtime cap scaling when Cursor enforces a tighter window; detailed cost table for all current families; effort-suffix variants deduplicated so pi's reasoning-level setting drives the suffix automatically
 - **Thinking-tag filtering** — inline `<think>` / `<reasoning>` tags stripped from the response and routed to `reasoning_content`
@@ -26,6 +26,18 @@ git clone https://github.com/offbynan/pi-cursor-provider ~/.pi/agent/extensions/
 cd ~/.pi/agent/extensions/cursor-provider
 npm install
 ```
+
+## Release 0.7
+
+Requires Pi 0.84 or newer under the `@earendil-works` package namespace and Node.js 22.19 or newer. This replaces the obsolete `@mariozechner` peer dependencies. The package is source distributed; no build step is needed.
+
+The bundled catalog is refreshed from Cursor discovery. It is a startup fallback, not a guarantee of access: your account's live catalog takes precedence. Model names preserve Cursor's privacy labels. In particular, **Fable is marked `NO ZDR`**. Do not treat the bridge's ghost mode header as a zero data retention guarantee, and do not send sensitive material to a model without confirming your organization's policy.
+
+Pricing is an estimate, not a Cursor invoice. Recent base rates are taken from [Cursor's pricing pages](https://cursor.com/docs/models-and-pricing), including [Fable 5.1](https://cursor.com/docs/models/claude-fable-5-1), [GPT 5.6 Sol](https://cursor.com/docs/models/gpt-5-6-sol), and [Grok 4.6](https://cursor.com/docs/models/grok-4-6). Missing prices retain family or generic estimates. Account surcharges and premiums for longer contexts are not included. The proxy also scales usage for compaction, so its token counts are not a reliable billing record.
+
+Discovery does not supply output limits. The registered 64,000 token output budget is an adapter default; the proxy does not forward `max_tokens` as an enforced Cursor generation limit. Context windows are estimates and may differ from the runtime cap. GPT 5.6 uses Cursor's documented default of 272 k, not its separately advertised 1M maximum.
+
+In release testing, Cursor streamed responses from Grok 4.6, GPT 5.6 Sol, and Claude Opus 5. Grok also completed a tool call and result replay. Fable requests were blocked by Cursor's administrative model access controls. The adapter now displays Cursor's own error title, detail, and additional display information rather than replacing them with local explanations or a generic finish reason. Astra was absent from the account catalog and has no verified Cursor ID in this release. Catalog visibility does not establish working access.
 
 ## Usage
 
@@ -50,6 +62,12 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
 3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol
 4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
+
+## Security
+
+The proxy binds only to `127.0.0.1` and uses an ephemeral random bearer token. Pi supplies that token automatically; the Cursor OAuth credential never becomes the local bearer token. Browser Origin headers and unexpected Host headers are rejected. Chat requests require JSON, have a finite body size, and are validated before upstream credentials are resolved.
+
+This is not a sandbox against code already running as your user. Extensions have full process access. Debug logging is explicitly opt in and can contain prompts, responses, and tool arguments. Keep logs private and inspect them before sharing. New log files are created with owner only permissions, symlink targets are rejected, and log write failures do not print payloads to stderr.
 
 ## Configuration
 
@@ -91,30 +109,28 @@ This fork fixes both: empty and non-JSON end-stream bodies are treated as succes
 
 The upstream proxy included a 30-minute TTL eviction mechanism (`evictStaleConversations`, `CONVERSATION_TTL_MS`, `sessionScoped`, `lastAccessMs`). All conversations created by pi include a session ID, permanently exempting them from TTL eviction, so this code was never reachable. This fork removes it.
 
-### Accurate per-model context window inference
+### Conservative context window estimates
 
-Cursor's `GetUsableModels` RPC does not return context window sizes, so the upstream proxy hardcodes 200 k for every model. This fork exports an `inferContextWindow(id)` function that derives the correct window from known model families:
+Cursor's `GetUsableModels` RPC does not return context or output limits. `inferContextWindow(id)` uses family estimates, not measured capacity. Claude remains registered at 200 k unless the ID explicitly indicates a larger window, because Cursor historically enforced a tighter cap than the native model specification. A `1M` display name alone does not establish the enforced capacity.
 
 | Family | Window |
 | ------ | ------ |
-| Claude 4.6 Sonnet / Opus | 1 M |
-| All other Claude | 200 k |
+| Claude without an explicit larger window in the ID | 200 k |
 | Gemini 2.5 / 3.x | 1 M |
 | GPT nano / mini variants | 128 k |
-| GPT-5.5+ | 1 M |
+| GPT 5.5 | 1 M |
+| GPT 5.6 Sol / Terra / Luna | 272 k |
 | GPT-5.x (other) | 400 k |
 | Grok 4 | 256 k |
 | Kimi K2.x | 262 k |
 | Anything with `-1m` suffix | 1 M |
 | Unknown / Composer | 200 k |
 
-This ensures pi uses the right compaction thresholds and token budget for each model.
+These estimates inform compaction thresholds. The runtime scaling below handles tighter caps when Cursor reports them. They are not a guarantee that every listed model supports the inferred maximum.
 
-### Post-compaction session sync
+### Checkpoints across compaction
 
-When pi compacts its message list (the `session_compact` lifecycle event), the proxy's cached conversation checkpoint still reflects the full pre-compaction conversation. Continuing without clearing that cache would cause a history mismatch, forcing an expensive full reconstruction on the next request.
-
-This fork listens for `session_compact` and eagerly clears the stored checkpoint for the affected session, so both sides stay in sync at zero extra cost.
+Pi compaction shortens the local message list, but Cursor's server checkpoint still carries conversation state and blob references. The `session_compact` hook deliberately preserves that checkpoint. Clearing it can lose server context because a synthetic reconstruction is not always equivalent. Session switches, forks, tree changes, and shutdown still clean up their state.
 
 ### Context window scaling when Cursor enforces a tighter cap
 
@@ -145,6 +161,12 @@ This fork deduplicates them: model variants that share the same base ID and diff
 Some models (notably certain Gemini variants) emit reasoning content inline with the response, wrapped in tags like `<think>`, `<thinking>`, `<reasoning>`, or `<thought>`. The upstream passes this through as raw text, polluting the main response with unrendered XML tags.
 
 This fork detects and strips these tags in the proxy's stream processor, routing the extracted content to the `reasoning_content` SSE field so pi renders it as structured reasoning rather than as part of the assistant's reply.
+
+### Upstream error display
+
+Cursor supplies user facing text in protobuf `aiserver.v1.ErrorDetails`. The adapter decodes the same `CustomErrorDetails` title, detail, and additional information that Cursor's CLI displays. It ignores diagnostic `debug` fields and analytics. If structured display text is unavailable, it preserves Cursor's raw Connect message. There are no model specific messages or code to explanation translations.
+
+Streaming errors use an OpenAI compatible SSE error object so Pi receives the actual message, not `Provider finish_reason: error`. Explicit upstream retryability is preserved. Native rate limit messages are no longer relabeled as context overflow.
 
 ### Structured debug logging
 
@@ -224,14 +246,15 @@ This fork removes the `!cancelled` guard. If Cursor sent a checkpoint before the
 
 ## Model Mapping
 
-Cursor exposes many model variants that encode **effort level** (`low`, `medium`, `high`, `xhigh`, `max`, `none`) and **speed** (`-fast`) or **thinking** (`-thinking`) in the model ID. This extension deduplicates them so pi's reasoning effort setting controls the effort level.
+Cursor exposes variants for reasoning effort, thinking, and speed. The extension groups related variants under a canonical picker ID while preserving the exact advertised RPC IDs in a lookup table. Effort suffixes include `minimal`, `none`, `low`, `medium`, `high`, `xhigh`, `extra-high`, and `max`.
 
 ### How it works
 
 Each raw Cursor model ID is parsed into components:
 
 ```
-{base}-{effort}[-fast|-thinking]
+{base}-{effort}[-thinking][-fast]
+{base}[-thinking]-{effort}[-fast]
 ```
 
 Examples:
@@ -244,17 +267,19 @@ Examples:
 | `gpt-5.1-codex-max-high`       | `gpt-5.1-codex-max` | `high`   | —           |
 | `composer-2`                   | `composer-2`        | —        | —           |
 
-Models sharing the same `(base, variant)` with **≥2 effort levels** and a sensible default (`medium` or no-suffix) are collapsed into a single entry with `supportsReasoningEffort: true`. Pi's thinking level maps to the effort suffix:
+Models sharing the same base, thinking mode, and speed are grouped even if only one mandatory effort tier exists. Pi's `thinkingLevelMap` selects an advertised tier; the proxy looks up its exact raw ID rather than assuming a suffix order.
 
 | Pi Level  | Cursor Suffix                   |
 | --------- | ------------------------------- |
-| `minimal` | `none` (if available) or `low`  |
-| `low`     | `low`                           |
-| `medium`  | `medium` or no suffix (default) |
-| `high`    | `high`                          |
-| `xhigh`   | `max` (Claude) or `xhigh` (GPT) |
+| `off` | `none`, then the bare default; hidden if neither exists |
+| `minimal` | `minimal`, then `none` or `low` |
+| `low` | `low` or the nearest available fallback |
+| `medium` | `medium` or the bare default |
+| `high` | `high` or an available fallback |
+| `xhigh` | `xhigh`, then `extra-high`, `max`, or `high` |
+| `max` | `max`; hidden unless that tier is advertised |
 
-The proxy inserts the effort before `-fast`/`-thinking`:
+Exact lookup preserves both historical and current suffix orders. Already raw IDs are left intact when no new effort is requested. For example, Fable's thinking variant uses `claude-fable-5-1-thinking-high`, while older Opus uses `claude-4.6-opus-high-thinking`.
 
 ```
 pi selects: gpt-5.4-fast  +  effort: high    →  Cursor receives: gpt-5.4-high-fast
@@ -294,7 +319,7 @@ When Cursor requests a tool call, the proxy pauses the SSE stream, stores the li
 
 ### Lifecycle cleanup
 
-Session state is cleared on pi lifecycle events — session switch, fork, `/tree`, shutdown, and post-compaction — so stale checkpoints never carry over into a new context.
+Session state is cleared on Pi lifecycle events for session switch, fork, `/tree`, and shutdown. Compaction deliberately preserves the Cursor checkpoint.
 
 ### Error resilience
 
@@ -302,16 +327,27 @@ Transient Cursor errors (`internal`, `unavailable`, `deadline_exceeded`) and bri
 
 ## Requirements
 
-- [Pi](https://github.com/badlogic/pi-mono)
-- [Node.js](https://nodejs.org) >= 18
+* [Pi](https://github.com/earendil-works/pi-mono) >= 0.84
+* [Node.js](https://nodejs.org) >= 22.19
 - Active [Cursor](https://cursor.com) subscription
 
 ## Development
 
 ```bash
-npm install
-npm test
+npm ci
+npm run check
+HOME="$(mktemp -d)" node scripts/smoke-package.mjs
+npm pack
 ```
+
+Live tests send only synthetic prompts and require explicit opt in plus existing Cursor authentication:
+
+```bash
+npm run test:live -- --live cursor-grok-4.6 gpt-5.6-sol
+npm run test:live -- --live --tool cursor-grok-4.6
+```
+
+Packing and publishing run the offline checks automatically. Publishing additionally requires npm authentication. A packed archive is not published until an explicit `npm publish` command is run.
 
 ## Debug log timeline
 

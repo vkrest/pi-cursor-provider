@@ -13,12 +13,20 @@
  */
 
 import rawFallbackModels from "./cursor-models-raw.json" with { type: "json" };
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import {
+  buildEffortMap,
+  canonicalModelId,
+  parseModelId,
+  setModelRouting,
+  type EffortMap,
+} from "./model-ids.js";
+export { buildEffortMap, parseModelId, type ParsedModelId } from "./model-ids.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type {
   OAuthCredentials,
   OAuthLoginCallbacks,
-} from "@mariozechner/pi-ai";
-import { appendFileSync } from "node:fs";
+} from "@earendil-works/pi-ai";
+import { appendPrivateLog } from "./secure-log.js";
 import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import {
@@ -30,9 +38,11 @@ import {
 import {
   cleanupSessionState,
   getCursorModels,
+  getProxyAuthToken,
   inferContextWindow,
   loadCachedModels,
   startProxy,
+  stopProxy,
   type CursorModel,
 } from "./proxy.js";
 
@@ -181,17 +191,39 @@ function debugExtensionLog(
   data?: Record<string, unknown>,
 ): void {
   if (!isExtensionDebugEnabled()) return;
-  const payload = JSON.stringify({
-    ts: new Date().toISOString(),
-    pid: process.pid,
-    scope: "extension",
-    event,
-    ...data,
-  });
-  appendFileSync(getExtensionDebugLogFilePath(), `${payload}\n`, "utf8");
+  try {
+    const payload = JSON.stringify({
+      ts: new Date().toISOString(),
+      pid: process.pid,
+      scope: "extension",
+      event,
+      ...data,
+    });
+    appendPrivateLog(getExtensionDebugLogFilePath(), `${payload}\n`);
+  } catch {
+    console.error("[pi-cursor-provider] Cannot safely write extension debug log");
+  }
 }
 
 const MODEL_COST_TABLE: Record<string, ModelCost> = {
+  // Cursor public model cards, checked 2026-09-05. Base-tier estimates only;
+  // usage scaling, long-context premiums, and account surcharges are separate.
+  "claude-fable-5-1": { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 },
+  "claude-fable-5": { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+  "claude-opus-5": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+  "claude-opus-5-fast": { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+  "claude-sonnet-5": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+  "gpt-5.6-sol": { input: 4, output: 20, cacheRead: 0.4, cacheWrite: 5 },
+  "gpt-5.6-sol-fast": { input: 8, output: 40, cacheRead: 0.8, cacheWrite: 10 },
+  "gpt-5.6-terra": { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 },
+  "gpt-5.6-terra-fast": { input: 4, output: 24, cacheRead: 0.4, cacheWrite: 5 },
+  "gpt-5.6-luna": { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
+  "gpt-5.6-luna-fast": { input: 0.4, output: 2.4, cacheRead: 0.04, cacheWrite: 0.5 },
+  "cursor-grok-4.6": { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+  "cursor-grok-4.6-fast": { input: 4, output: 12, cacheRead: 1, cacheWrite: 0 },
+  "composer-2.5": { input: 0.5, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
+  "composer-2.5-fast": { input: 3, output: 15, cacheRead: 0.5, cacheWrite: 0 },
+  "gemini-3.8-flash": { input: 0.75, output: 3.5, cacheRead: 0.075, cacheWrite: 0 },
   "claude-4-sonnet": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
   "claude-4.5-haiku": { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
   "claude-4.5-opus": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
@@ -237,6 +269,8 @@ const MODEL_COST_TABLE: Record<string, ModelCost> = {
   "gpt-5.4-mini": { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
   "gpt-5.4-nano": { input: 0.2, output: 1.25, cacheRead: 0.02, cacheWrite: 0 },
   "gpt-5.5": { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+  "cursor-grok-4.5": { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+  "cursor-grok-4.5-fast": { input: 4, output: 18, cacheRead: 1, cacheWrite: 0 },
   "grok-4.20": { input: 2, output: 6, cacheRead: 0.2, cacheWrite: 0 },
   "grok-4-3": { input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
   "grok-4.3": { input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
@@ -314,9 +348,12 @@ const DEFAULT_COST: ModelCost = {
   cacheWrite: 0,
 };
 
-function estimateModelCost(modelId: string): ModelCost {
+export function estimateModelCost(modelId: string): ModelCost {
   const normalized = modelId.toLowerCase();
-  const exact = MODEL_COST_TABLE[normalized];
+  const parsed = parseModelId(normalized);
+  // Thinking and effort do not change the public base-tier rate; Fast can.
+  const priceId = `${parsed.base}${parsed.fast ? "-fast" : ""}`;
+  const exact = MODEL_COST_TABLE[normalized] ?? MODEL_COST_TABLE[priceId];
   if (exact) return exact;
   const stripped = normalized.replace(
     /-(high|medium|low|preview|thinking|spark-preview|fast)$/g,
@@ -331,55 +368,9 @@ function estimateModelCost(modelId: string): ModelCost {
 
 // ── Effort-level dedup ──
 
-const EFFORT_LEVELS = new Set([
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-  "none",
-]);
-
-interface ParsedModelId {
-  base: string; // model ID with effort stripped
-  effort: string; // effort level, or "" if no effort suffix
-  fast: boolean; // has -fast suffix
-  thinking: boolean; // has -thinking suffix
-}
-
-export function parseModelId(id: string): ParsedModelId {
-  let remaining = id;
-  let fast = false;
-  let thinking = false;
-
-  if (remaining.endsWith("-fast")) {
-    fast = true;
-    remaining = remaining.slice(0, -5);
-  }
-  if (remaining.endsWith("-thinking")) {
-    thinking = true;
-    remaining = remaining.slice(0, -9);
-  }
-
-  const lastDash = remaining.lastIndexOf("-");
-  if (lastDash >= 0) {
-    const suffix = remaining.slice(lastDash + 1);
-    if (EFFORT_LEVELS.has(suffix)) {
-      return {
-        base: remaining.slice(0, lastDash),
-        effort: suffix,
-        fast,
-        thinking,
-      };
-    }
-  }
-
-  return { base: remaining, effort: "", fast, thinking };
-}
-
 interface ProcessedModel extends CursorModel {
   supportsEffort: boolean;
-  effortMap?: Record<string, string>;
+  effortMap?: EffortMap;
 }
 
 export function supportsReasoningModelId(id: string): boolean {
@@ -387,62 +378,20 @@ export function supportsReasoningModelId(id: string): boolean {
   if (effort || thinking) return true;
   // Cursor Auto picks the backend model itself; it has no reasoning-effort suffix.
   if (base === "default") return false;
-  // Cursor-branded Grok IDs use a cursor-grok prefix instead of bare grok-.
-  if (/^cursor-grok/i.test(base)) return true;
-  return /^(claude|composer|gemini|gpt|grok|kimi)(-|$)/i.test(base);
+  return /^(claude|composer|cursor-grok|gemini|gpt|grok|kimi)(-|$)/i.test(base);
 }
 
-/**
- * Ordered effort levels from lowest to highest.
- * "" = default (no effort suffix in model ID).
- */
-const EFFORT_ORDER = [
-  "none",
-  "low",
-  "",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const;
-
-/**
- * Build a reasoning-effort map from the set of available effort suffixes.
- * For each pi effort level (minimal/low/medium/high/xhigh), picks the closest
- * available cursor effort, falling back to the lowest available.
- */
-export function buildEffortMap(efforts: Set<string>): Record<string, string> {
-  const sorted = EFFORT_ORDER.filter((e) => efforts.has(e));
-  if (sorted.length === 0) return {};
-  const lowest = sorted[0]!;
-
-  const pick = (...targets: string[]) => {
-    for (const t of targets) if (efforts.has(t)) return t;
-    return lowest;
-  };
-
+/** Map pi thinking levels to advertised Cursor suffixes, hiding unsupported off/max. */
+export function buildThinkingLevelMap(effortMap: EffortMap): EffortMap {
+  const fallback = effortMap.medium ?? effortMap.low ?? effortMap.high ?? null;
   return {
-    minimal: pick("none", "low", ""),
-    low: pick("low", "none", ""),
-    medium: pick("medium", "", "low"),
-    high: pick("high", "medium", ""),
-    xhigh: pick("max", "xhigh", "high"),
-  };
-}
-
-/** Map pi thinking levels to Cursor effort suffixes for deduped models. */
-export function buildThinkingLevelMap(
-  effortMap: Record<string, string>,
-): Record<string, string> {
-  const fallback =
-    effortMap.medium ?? effortMap.low ?? effortMap.high ?? "medium";
-  return {
-    off: fallback,
-    minimal: effortMap.minimal ?? effortMap.low ?? fallback,
+    off: effortMap.off ?? null,
+    minimal: effortMap.minimal ?? fallback,
     low: effortMap.low ?? fallback,
     medium: effortMap.medium ?? fallback,
     high: effortMap.high ?? fallback,
-    xhigh: effortMap.xhigh ?? effortMap.high ?? fallback,
+    xhigh: effortMap.xhigh ?? null,
+    max: effortMap.max ?? null,
   };
 }
 
@@ -491,9 +440,7 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
         [...g.efforts.values()][0]!;
 
       // Build deduped model ID: base + thinking/fast suffix (no effort)
-      let id = g.base;
-      if (g.thinking) id += "-thinking";
-      if (g.fast) id += "-fast";
+      const id = canonicalModelId({ ...g, effort: "" });
 
       const effortMap = buildEffortMap(new Set(g.efforts.keys()));
 
@@ -509,7 +456,7 @@ export function processModels(raw: CursorModel[]): ProcessedModel[] {
   return result.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function modelConfig(m: ProcessedModel) {
+export function modelConfig(m: ProcessedModel) {
   const reasoning = m.supportsEffort || supportsReasoningModelId(m.id);
   const thinkingLevelMap =
     m.supportsEffort && m.effortMap
@@ -673,6 +620,10 @@ function registerExtensionDebugHooks(pi: ExtensionAPI) {
 export default async function (pi: ExtensionAPI): Promise<void> {
   // Current access token, updated by login/refresh/getApiKey
   let currentToken = "";
+  let stopped = false;
+  function assertRunning(): void {
+    if (stopped) throw new Error("Cursor provider has shut down");
+  }
 
   // Start proxy eagerly — it just binds a port, no auth needed until a request arrives.
   // The getAccessToken callback reads currentToken at request time.
@@ -685,6 +636,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const skipDedup = !!process.env.PI_CURSOR_RAW_MODELS;
 
   registerSessionLifecycleCleanup(pi);
+  pi.on("session_shutdown", () => {
+    stopped = true;
+    currentToken = "";
+    stopProxy();
+  });
   registerExtensionDebugHooks(pi);
   debugExtensionLog("extension.start", {
     debugLogFile: isExtensionDebugEnabled()
@@ -719,7 +675,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // the model list refreshes every session, not just on auth changes.
   let startupDiscoveryDone = false;
   async function ensureStartupDiscovery(token: string): Promise<void> {
-    if (startupDiscoveryDone || !token) return;
+    if (stopped || startupDiscoveryDone || !token) return;
     startupDiscoveryDone = true;
     try {
       const discovered = await getCursorModels(token);
@@ -730,6 +686,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   }
 
   function register(pi: ExtensionAPI, port: number, rawModels: CursorModel[]) {
+    if (stopped) return;
     const baseUrl = `http://127.0.0.1:${port}/v1`;
     const processed = skipDedup
       ? rawModels.map(
@@ -737,6 +694,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         )
       : processModels(rawModels);
 
+    setModelRouting(rawModels);
     pi.registerProvider("cursor", {
       baseUrl,
       api: "openai-completions",
@@ -745,17 +703,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         name: "Cursor",
 
         async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+          assertRunning();
           const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
+          assertRunning();
           callbacks.onAuth({ url: loginUrl });
           const { accessToken, refreshToken } = await pollCursorAuth(
             uuid,
             verifier,
           );
+          assertRunning();
           currentToken = accessToken;
 
           // Discover real models and re-register
           const realPort = await proxyReady;
+          assertRunning();
           const discovered = await getCursorModels(accessToken);
+          assertRunning();
           if (discovered.length > 0) register(pi, realPort, discovered);
 
           return {
@@ -768,21 +731,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         async refreshToken(
           credentials: OAuthCredentials,
         ): Promise<OAuthCredentials> {
+          assertRunning();
           const refreshed = await refreshCursorToken(credentials.refresh);
+          assertRunning();
           currentToken = refreshed.access;
 
           // Discover real models on refresh too
           const realPort = await proxyReady;
+          assertRunning();
           const discovered = await getCursorModels(refreshed.access);
+          assertRunning();
           if (discovered.length > 0) register(pi, realPort, discovered);
 
           return refreshed;
         },
 
         getApiKey(credentials: OAuthCredentials): string {
+          assertRunning();
           currentToken = credentials.access;
           void ensureStartupDiscovery(credentials.access);
-          return "cursor-proxy";
+          return getProxyAuthToken();
         },
       },
     });

@@ -31,11 +31,26 @@ try {
   process.exit(1);
 }
 
-const models = Array.isArray(cache?.models) ? cache.models : [];
-if (models.length === 0) {
+const rawModels = Array.isArray(cache?.models) ? cache.models : [];
+if (rawModels.length === 0) {
   console.error(`No discovered models found in ${cachePath}.`);
   process.exit(1);
 }
+
+// Only publish normalized catalog metadata, never arbitrary cached properties
+// such as credentials from a raw model-discovery response.
+const models = rawModels.map((model) => {
+  if (!model || typeof model.id !== "string" || !model.id.trim()
+    || typeof model.name !== "string" || typeof model.reasoning !== "boolean"
+    || !Number.isSafeInteger(model.contextWindow) || model.contextWindow <= 0
+    || !Number.isSafeInteger(model.maxTokens) || model.maxTokens <= 0) {
+    throw new Error("Invalid cached model metadata; refusing to overwrite the bundled snapshot");
+  }
+  return {
+    id: model.id, name: model.name, reasoning: model.reasoning,
+    contextWindow: model.contextWindow, maxTokens: model.maxTokens,
+  };
+});
 
 models.sort((a, b) => String(a.id).localeCompare(String(b.id)));
 writeFileSync(outPath, `${JSON.stringify(models, null, 2)}\n`, "utf-8");

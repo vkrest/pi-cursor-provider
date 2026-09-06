@@ -19,9 +19,12 @@ import {
   type ServerResponse,
 } from "node:http";
 import { spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { appendPrivateLog } from "./secure-log.js";
+import { resolveModelId } from "./model-ids.js";
+import { parseCursorError as parseConnectEndStream, type CursorUpstreamError as ConnectEndStreamError } from "./cursor-errors.js";
+export { resolveModelId } from "./model-ids.js";
 import {
-  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -329,7 +332,8 @@ function sanitizeForDebug(value: unknown): unknown {
   if (typeof value === "object") {
     const entries = Object.entries(value as Record<string, unknown>).map(
       ([key, inner]) => {
-        if (key === "accessToken") return [key, "<redacted>"] as const;
+        if (/^(?:authorization|proxy-authorization|cookie|set-cookie|accessToken|refreshToken|access|refresh|token|apiKey)$/i.test(key))
+          return [key, "<redacted>"] as const;
         if (key === "data" && typeof inner === "string")
           return [key, `<redacted base64 ${inner.length} chars>`] as const;
         return [key, sanitizeForDebug(inner)] as const;
@@ -354,18 +358,17 @@ function getDebugLogFilePath(): string {
 
 function debugLog(event: string, data?: Record<string, unknown>): void {
   if (!isProxyDebugEnabled()) return;
-  const line = JSON.stringify({
-    ts: new Date().toISOString(),
-    pid: process.pid,
-    event,
-    ...(data ? sanitizeForDebug(data) : {}),
-  });
-  const file = getDebugLogFilePath();
   try {
-    appendFileSync(file, `${line}\n`, "utf8");
-  } catch (error) {
-    console.error("[pi-cursor-provider] failed to write debug log", error);
-    console.error(`[pi-cursor-provider] ${line}`);
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      pid: process.pid,
+      event,
+      ...(data ? sanitizeForDebug(data) : {}),
+    });
+    appendPrivateLog(getDebugLogFilePath(), `${line}\n`);
+  } catch {
+    // Debug output may include prompts and tool results. Never fall back to stderr.
+    console.error("[pi-cursor-provider] Cannot safely write debug log");
   }
 }
 
@@ -375,6 +378,9 @@ function nextDebugRequestId(): string {
 }
 
 export const __testInternals = {
+  spawnBridge,
+  bridgeNodeExecutable,
+  readBody,
   activeBridges,
   sessionBridges,
   conversationStates,
@@ -387,6 +393,14 @@ export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
 let proxyServer: ReturnType<typeof createServer> | undefined;
 let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
+let proxyAuthToken: string | undefined;
+let proxyStartPromise: Promise<number> | undefined;
+
+export const MAX_PROXY_BODY_BYTES = 32 * 1024 * 1024;
+const PROXY_BODY_TIMEOUT_MS = 30_000;
+const bridgeHeartbeats = new Map<BridgeHandle, ReturnType<typeof setInterval>>();
+const bridgeKillTimers = new Map<BridgeHandle, ReturnType<typeof setTimeout>>();
+const disposedBridges = new WeakSet<BridgeHandle>();
 
 // ── Bridge spawn ──
 
@@ -412,19 +426,69 @@ interface SpawnBridgeOptions {
   unary?: boolean;
 }
 
-function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
+function bridgeNodeExecutable(
+  versions: NodeJS.ProcessVersions = process.versions,
+  execPath = process.execPath,
+): string {
+  // The bridge specifically requires Node's HTTP/2 implementation, not Bun's.
+  return versions.bun ? "node" : execPath;
+}
+
+function spawnBridge(options: SpawnBridgeOptions, spawnProcess: typeof spawn = spawn): BridgeHandle {
   debugLog("bridge.spawn", {
     rpcPath: options.rpcPath,
     url: options.url ?? CURSOR_API_URL,
     unary: options.unary ?? false,
   });
-  const proc = spawn("node", [BRIDGE_PATH], {
+  const proc = spawnProcess(bridgeNodeExecutable(), [BRIDGE_PATH], {
     stdio: ["pipe", "pipe", "pipe"],
   });
-
   const stderrData: StderrData = {};
+  const cbs = {
+    data: null as ((chunk: Buffer) => void) | null,
+    close: null as ((code: number) => void) | null,
+  };
+  let exited = false;
+  let exitCode = 1;
+  let closeDelivered = false;
   let stderrBuf = "";
+  let pending = Buffer.alloc(0);
+
+  const notifyClose = () => {
+    if (!exited || !cbs.close || closeDelivered) return;
+    closeDelivered = true;
+    cbs.close(exitCode);
+  };
+  const finish = (code: number) => {
+    if (exited) return;
+    exited = true;
+    exitCode = code;
+    pending = Buffer.alloc(0);
+    stderrBuf = "";
+    // Keep error listeners installed: destroying a pipe can still emit error.
+    try { proc.stdout!.destroy(); } catch {}
+    try { proc.stdin!.destroy(); } catch {}
+    try { proc.stderr!.destroy(); } catch {}
+    debugLog("bridge.exit", { rpcPath: options.rpcPath, exitCode });
+    queueMicrotask(notifyClose);
+  };
+  const fail = () => {
+    if (exited) return;
+    stderrData.exitReason ??= "stream_error";
+    finish(1);
+    try { proc.kill(); } catch {}
+  };
+  // Install these before the first write: ENOENT and EPIPE are asynchronous.
+  // Never log exception details, which may contain request or credential data.
+  proc.on("error", fail);
+  proc.stdin!.on("error", fail);
+  proc.stdout!.on("error", fail);
+  proc.stderr!.on("error", fail);
+  proc.once("exit", (code) => finish(code ?? 1));
+  proc.once("close", (code) => finish(code ?? 1));
+
   proc.stderr!.on("data", (chunk: Buffer) => {
+    if (exited) return;
     stderrBuf += chunk.toString("utf8");
     let nl: number;
     while ((nl = stderrBuf.indexOf("\n")) !== -1) {
@@ -447,25 +511,8 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
       }
     }
   });
-
-  const config = JSON.stringify({
-    accessToken: options.accessToken,
-    url: options.url ?? CURSOR_API_URL,
-    path: options.rpcPath,
-    unary: options.unary ?? false,
-  });
-  proc.stdin!.write(lpEncode(new TextEncoder().encode(config)));
-
-  const cbs = {
-    data: null as ((chunk: Buffer) => void) | null,
-    close: null as ((code: number) => void) | null,
-  };
-
-  let exited = false;
-  let exitCode = 1;
-
-  let pending = Buffer.alloc(0);
   proc.stdout!.on("data", (chunk: Buffer) => {
+    if (exited) return;
     pending = Buffer.concat([pending, chunk]);
     while (pending.length >= 4) {
       const len = pending.readUInt32BE(0);
@@ -476,37 +523,33 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
     }
   });
 
-  proc.on("exit", (code) => {
-    exited = true;
-    exitCode = code ?? 1;
-    // Destroy stdio pipes immediately so their handles don't keep the event
-    // loop alive after the bridge exits (critical for `pi -p` to exit cleanly).
-    try { proc.stdout!.destroy(); } catch {}
-    try { proc.stdin!.destroy(); } catch {}
-    try { proc.stderr!.destroy(); } catch {}
-    debugLog("bridge.exit", { rpcPath: options.rpcPath, exitCode });
-    cbs.close?.(exitCode);
+  const config = JSON.stringify({
+    accessToken: options.accessToken,
+    url: options.url ?? CURSOR_API_URL,
+    path: options.rpcPath,
+    unary: options.unary ?? false,
   });
+  try {
+    proc.stdin!.write(lpEncode(new TextEncoder().encode(config)));
+  } catch {
+    fail();
+  }
 
   return {
     proc,
-    get alive() {
-      return !exited;
-    },
+    get alive() { return !exited; },
     write(data: Uint8Array) {
-      try {
-        proc.stdin!.write(lpEncode(data));
-      } catch {}
+      if (exited) return;
+      try { proc.stdin!.write(lpEncode(data)); } catch { fail(); }
     },
     end() {
+      if (exited) return;
       try {
         proc.stdin!.write(lpEncode(new Uint8Array(0)));
         proc.stdin!.end();
-      } catch {}
+      } catch { fail(); }
     },
-    onData(cb: (chunk: Buffer) => void) {
-      cbs.data = cb;
-    },
+    onData(cb: (chunk: Buffer) => void) { cbs.data = cb; },
     unref() {
       try {
         proc.unref();
@@ -514,15 +557,10 @@ function spawnBridge(options: SpawnBridgeOptions): BridgeHandle {
       } catch {}
     },
     onClose(cb: (code: number) => void) {
-      if (exited) {
-        queueMicrotask(() => cb(exitCode));
-      } else {
-        cbs.close = cb;
-      }
+      cbs.close = cb;
+      if (exited) queueMicrotask(notifyClose);
     },
-    getStderr() {
-      return stderrData;
-    },
+    getStderr() { return stderrData; },
   };
 }
 
@@ -772,14 +810,16 @@ export function inferContextWindow(id: string): number {
   if (lower.startsWith("gemini-")) return 1_048_576;
 
   // ── GPT ───────────────────────────────────────────────────────────────────
-  // nano / mini variants: 128k.  GPT-5.5+: 1M.  Everything else (5.x): 400k.
+  // nano / mini variants: 128k. GPT 5.6 Cursor cards advertise 272k in
+  // default mode; 1M is a separate maximum, not assumed for this transport.
   if (/^gpt-[0-9.]*-(nano|mini)/.test(lower)) return 128_000;
+  if (/^gpt-5\.6-(sol|terra|luna)(-|$)/.test(lower)) return 272_000;
   if (lower.startsWith("gpt-5.5")) return 1_048_576;
   if (lower.startsWith("gpt-")) return 400_000;
 
   // ── Grok ──────────────────────────────────────────────────────────────────
   // Grok 4 series: 256k.
-  if (lower.startsWith("grok-")) return 256_000;
+  if (lower.startsWith("grok-") || lower.startsWith("cursor-grok-")) return 256_000;
 
   // ── Kimi ──────────────────────────────────────────────────────────────────
   // Kimi K2.x: 262,144 tokens (256k).
@@ -815,87 +855,168 @@ export function getProxyPort(): number | undefined {
   return proxyPort;
 }
 
+/** In-memory bearer for this proxy instance; never an upstream Cursor credential. */
+export function getProxyAuthToken(): string {
+  if (!proxyAuthToken || !proxyPort) throw new Error("Cursor proxy is not running");
+  return proxyAuthToken;
+}
+
+class ProxyRequestError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function hasValidProxyAuth(req: IncomingMessage, token: string): boolean {
+  const values = req.headersDistinct.authorization;
+  if (values?.length !== 1) return false;
+  const expected = Buffer.from(`Bearer ${token}`, "utf8");
+  const provided = Buffer.from(values[0]!, "utf8");
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
+}
+
+function sendProxyError(res: ServerResponse, status: number, message: string): void {
+  if (res.destroyed || res.writableEnded) return;
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+    Connection: "close",
+    ...(status === 401 ? { "WWW-Authenticate": "Bearer" } : {}),
+  });
+  res.end(JSON.stringify({ error: {
+    message,
+    type: status >= 500 ? "server_error" : "invalid_request_error",
+    code: status >= 500 ? "internal_error" : "invalid_request",
+  } }));
+}
+
 export async function startProxy(
   getAccessToken: () => Promise<string>,
 ): Promise<number> {
   proxyAccessTokenProvider = getAccessToken;
   if (proxyServer && proxyPort) return proxyPort;
+  if (proxyStartPromise) return proxyStartPromise;
 
-  return new Promise((resolve, reject) => {
-    const server = createServer(async (req, res) => {
-      const url = new URL(req.url ?? "/", `http://localhost`);
-      const requestId = nextDebugRequestId();
-      debugLog("http.request", {
-        requestId,
-        method: req.method,
-        pathname: url.pathname,
-        headers: req.headers,
-      });
-
-      // Prevent HTTP keep-alive from holding the event loop open after a
-      // response completes (critical for `pi -p` to exit cleanly).
+  const token = randomBytes(32).toString("hex");
+  proxyAuthToken = token;
+  const starting = new Promise<number>((resolve, reject) => {
+    const server = createServer({
+      maxHeaderSize: 16 * 1024,
+      headersTimeout: 15_000,
+      requestTimeout: PROXY_BODY_TIMEOUT_MS,
+    }, async (req, res) => {
+      // Authenticate before reading a body, recording request content, or resolving
+      // credentials. Browser and DNS rebinding checks are defense in depth.
       res.setHeader("Connection", "close");
-
-      if (req.method === "GET" && url.pathname === "/v1/models") {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ object: "list", data: [] }));
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
-        try {
-          const body = await readBody(req);
-          const parsed = JSON.parse(body) as ChatCompletionRequest;
-          debugLog("http.chat.body", { requestId, body: parsed });
-          if (!proxyAccessTokenProvider)
-            throw new Error("No access token provider");
-          const accessToken = await proxyAccessTokenProvider();
-          await handleChatCompletion(parsed, accessToken, req, res, requestId);
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          debugLog("http.chat.error", {
-            requestId,
-            message,
-            stack: err instanceof Error ? err.stack : undefined,
-          });
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: { message, type: "server_error", code: "internal_error" },
-            }),
-          );
+      // An aborted IncomingMessage can emit error after its aborted event.
+      req.on("error", () => {});
+      res.once("finish", () => {
+        if (!req.complete) req.destroy();
+      });
+      let requestId: string | undefined;
+      try {
+        if (!hasValidProxyAuth(req, token) || proxyServer !== server) {
+          throw new ProxyRequestError(401, "Proxy authentication required");
         }
-        return;
+        if (req.headersDistinct.origin !== undefined) {
+          throw new ProxyRequestError(403, "Browser origins are not allowed");
+        }
+        const host = `127.0.0.1:${proxyPort}`;
+        if (req.headersDistinct.host?.length !== 1 || req.headers.host !== host) {
+          throw new ProxyRequestError(403, "Unexpected proxy host");
+        }
+        if (!req.url?.startsWith("/") || req.url.startsWith("//")) {
+          throw new ProxyRequestError(400, "Invalid request target");
+        }
+        let pathname: string;
+        try {
+          const target = new URL(req.url, `http://${host}`);
+          if (target.host !== host) throw new Error("Invalid host");
+          pathname = target.pathname;
+        } catch {
+          throw new ProxyRequestError(400, "Invalid request target");
+        }
+        requestId = nextDebugRequestId();
+        debugLog("http.request", { requestId, method: req.method, pathname });
+
+        if (req.method === "GET" && pathname === "/v1/models") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ object: "list", data: [] }));
+          return;
+        }
+        if (req.method !== "POST" || pathname !== "/v1/chat/completions") {
+          sendProxyError(res, 404, "Not found");
+          return;
+        }
+        if (req.headersDistinct["content-type"]?.length !== 1 ||
+          !/^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i.test(req.headers["content-type"] ?? "") ||
+          (req.headers["content-encoding"] !== undefined && req.headers["content-encoding"] !== "identity")) {
+          throw new ProxyRequestError(415, "Content-Type must be application/json with UTF-8 encoding");
+        }
+        const body = await readBody(req);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          throw new ProxyRequestError(400, "Malformed JSON request");
+        }
+        validateChatRequest(parsed);
+        const parsedMessages = parseMessages(parsed.messages);
+        if (!parsedMessages.userText && parsedMessages.toolResults.length === 0) {
+          throw new ProxyRequestError(400, "No user message found");
+        }
+        // Shutdown may have occurred while the client was still sending its body.
+        if (proxyServer !== server || !proxyAccessTokenProvider || res.destroyed) return;
+        debugLog("http.chat.body", { requestId, body: parsed });
+        const accessToken = await proxyAccessTokenProvider();
+        if (proxyServer !== server || res.destroyed) return;
+        await handleChatCompletion(parsed, accessToken, req, res, requestId, parsedMessages);
+      } catch (error) {
+        req.pause();
+        const status = error instanceof ProxyRequestError ? error.status : 500;
+        const message = error instanceof ProxyRequestError ? error.message : "Cursor proxy request failed";
+        // Never send exception messages, stacks, request bodies, or credentials.
+        debugLog("http.chat.error", { requestId, status });
+        sendProxyError(res, status, message);
       }
-
-      res.writeHead(404);
-      res.end("Not Found");
     });
-
+    proxyServer = server;
+    server.on("connection", (socket) => socket.unref());
+    server.once("error", () => {
+      if (proxyServer === server) {
+        proxyServer = undefined;
+        proxyPort = undefined;
+        proxyAuthToken = undefined;
+        proxyAccessTokenProvider = undefined;
+      }
+      reject(new Error("Failed to bind Cursor proxy"));
+    });
+    server.once("close", () => reject(new Error("Cursor proxy stopped before startup")));
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
-      if (typeof addr === "object" && addr) {
+      if (proxyServer === server && typeof addr === "object" && addr) {
         proxyPort = addr.port;
-        proxyServer = server;
-        // Don't hold the event loop open — pi -p must be able to exit cleanly
-        // after a response without an explicit shutdown signal.
         server.unref();
-        // unref() only covers the listening socket; accepted connection sockets
-        // are ref'd by default. Unref each accepted socket so keep-alive HTTP
-        // connections don't prevent process exit either.
-        server.on("connection", (socket) => socket.unref());
-        debugLog("proxy.start", {
-          port: proxyPort,
-          debugLogFile: isProxyDebugEnabled()
-            ? getDebugLogFilePath()
-            : undefined,
-        });
+        debugLog("proxy.start", { port: proxyPort });
         resolve(proxyPort);
       } else {
-        reject(new Error("Failed to bind proxy"));
+        server.close();
+        reject(new Error("Failed to bind Cursor proxy"));
       }
     });
   });
+  proxyStartPromise = starting;
+  try {
+    return await starting;
+  } finally {
+    if (proxyStartPromise === starting) proxyStartPromise = undefined;
+  }
 }
 
 export function cleanupAllSessionState(): void {
@@ -903,66 +1024,135 @@ export function cleanupAllSessionState(): void {
     activeBridgeCount: activeBridges.size,
     conversationCount: conversationStates.size,
   });
-  for (const [bridgeKey, active] of activeBridges) {
-    cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
+  const bridges = new Set<BridgeHandle>([
+    ...sessionBridges.values(), ...bridgeHeartbeats.keys(), ...bridgeKillTimers.keys(),
+  ]);
+  for (const active of activeBridges.values()) {
+    clearInterval(active.heartbeatTimer);
+    bridges.add(active.bridge);
   }
+  for (const timer of bridgeHeartbeats.values()) clearInterval(timer);
+  for (const timer of bridgeKillTimers.values()) clearTimeout(timer);
+  bridgeHeartbeats.clear();
+  bridgeKillTimers.clear();
+  activeBridges.clear();
   sessionBridges.clear();
   conversationStates.clear();
+  for (const bridge of bridges) {
+    disposedBridges.add(bridge);
+    if (bridge.alive) {
+      try { sendCancelAction(bridge); } catch {}
+      try { bridge.end(); } catch {}
+      try { bridge.proc.kill(); } catch {}
+    }
+  }
 }
 
 export function stopProxy(): void {
   debugLog("proxy.stop", { port: proxyPort });
-  if (proxyServer) {
-    proxyServer.close();
-    proxyServer = undefined;
-    proxyPort = undefined;
-    proxyAccessTokenProvider = undefined;
-  }
+  const server = proxyServer;
+  proxyServer = undefined;
+  proxyPort = undefined;
+  proxyAuthToken = undefined;
+  proxyAccessTokenProvider = undefined;
+  proxyStartPromise = undefined;
+  server?.close();
+  server?.closeAllConnections();
   cleanupAllSessionState();
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
+  const declared = req.headers["content-length"];
+  if (declared !== undefined) {
+    if (!/^\d+$/.test(declared) || !Number.isSafeInteger(Number(declared))) {
+      throw new ProxyRequestError(400, "Invalid Content-Length");
+    }
+    if (Number(declared) > MAX_PROXY_BODY_BYTES) {
+      throw new ProxyRequestError(413, "Request body exceeds 32 MiB");
+    }
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    let size = 0;
+    let settled = false;
+    const timer = setTimeout(() => fail(new ProxyRequestError(408, "Request body timed out")), PROXY_BODY_TIMEOUT_MS);
+    timer.unref();
+    const cleanup = () => {
+      clearTimeout(timer);
+      req.removeListener("data", onData);
+      req.removeListener("end", onEnd);
+      req.removeListener("error", onError);
+      req.removeListener("aborted", onAborted);
+      req.removeListener("close", onClose);
+    };
+    const fail = (error: ProxyRequestError) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      chunks.length = 0;
+      req.pause();
+      reject(error);
+    };
+    const onData = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_PROXY_BODY_BYTES) {
+        fail(new ProxyRequestError(413, "Request body exceeds 32 MiB"));
+      } else chunks.push(chunk);
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      const body = Buffer.concat(chunks, size).toString("utf8");
+      chunks.length = 0;
+      resolve(body);
+    };
+    const onError = () => fail(new ProxyRequestError(400, "Failed to read request body"));
+    const onAborted = () => fail(new ProxyRequestError(400, "Request body aborted"));
+    const onClose = () => { if (!req.complete) onAborted(); };
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onError);
+    req.once("aborted", onAborted);
+    req.once("close", onClose);
+    if (req.destroyed) onAborted();
   });
 }
 
-// ── Request handling ──
-
-/**
- * Insert reasoning effort into model ID, before -fast/-thinking suffix.
- * e.g. model="gpt-5.4" + effort="medium" → "gpt-5.4-medium"
- *      model="gpt-5.4-fast" + effort="high" → "gpt-5.4-high-fast"
- * If no effort provided, returns model as-is.
- */
-export function resolveModelId(
-  model: string,
-  reasoningEffort?: string,
-): string {
-  let suffix = "";
-  let base = model;
-  if (base.endsWith("-fast")) {
-    suffix = "-fast";
-    base = base.slice(0, -5);
-  } else if (base.endsWith("-thinking")) {
-    suffix = "-thinking";
-    base = base.slice(0, -9);
-  }
-
-  // Cursor Auto ignores effort tiers; suffixes like default-medium error out.
-  if (base === "default") return model;
-
-  // Cursor Grok only exists as low/medium/high variants — default to medium.
-  if (!reasoningEffort && /^cursor-grok/i.test(base)) {
-    reasoningEffort = "medium";
-  }
-  if (!reasoningEffort) return model;
-
-  return `${base}-${reasoningEffort}${suffix}`;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+
+function validContent(value: unknown): boolean {
+  return value == null || typeof value === "string" ||
+    (Array.isArray(value) && value.every((part) =>
+      isRecord(part) && typeof part.type === "string" &&
+      (part.text === undefined || typeof part.text === "string") &&
+      (part.image_url === undefined || (isRecord(part.image_url) && typeof part.image_url.url === "string"))));
+}
+
+function validateChatRequest(value: unknown): asserts value is ChatCompletionRequest {
+  if (!isRecord(value) || typeof value.model !== "string" ||
+    !value.model.trim() || value.model.length > 1024 ||
+    !Array.isArray(value.messages) || value.messages.length === 0 ||
+    !value.messages.every((message) =>
+      isRecord(message) && typeof message.role === "string" &&
+      ["system", "user", "assistant", "tool"].includes(message.role) && validContent(message.content) &&
+      (message.tool_call_id === undefined || typeof message.tool_call_id === "string") &&
+      (message.tool_calls == null || (Array.isArray(message.tool_calls) && message.tool_calls.every((call) =>
+        isRecord(call) && typeof call.id === "string" && isRecord(call.function) &&
+        typeof call.function.name === "string" && typeof call.function.arguments === "string")))) ||
+    (value.stream !== undefined && typeof value.stream !== "boolean") ||
+    (value.reasoning_effort !== undefined && typeof value.reasoning_effort !== "string") ||
+    (value.tools != null && (!Array.isArray(value.tools) || !value.tools.every((tool) =>
+      isRecord(tool) && isRecord(tool.function) && typeof tool.function.name === "string" &&
+      (tool.function.description === undefined || typeof tool.function.description === "string") &&
+      (tool.function.parameters == null || isRecord(tool.function.parameters)))))) {
+    throw new ProxyRequestError(400, "Invalid chat completion request");
+  }
+}
+
+// ── Request handling ──
 
 async function handleChatCompletion(
   body: ChatCompletionRequest,
@@ -970,9 +1160,9 @@ async function handleChatCompletion(
   req: IncomingMessage,
   res: ServerResponse,
   requestId: string,
+  parsedMessages: ParsedMessages,
 ): Promise<void> {
-  const { systemPrompt, userText, userImages, turns, toolResults } =
-    parseMessages(body.messages);
+  const { systemPrompt, userText, userImages, turns, toolResults } = parsedMessages;
   const modelId = resolveModelId(body.model, body.reasoning_effort);
   const tools = body.tools ?? [];
 
@@ -987,20 +1177,6 @@ async function handleChatCompletion(
     resolvedModelId: modelId,
     stream: body.stream !== false,
   });
-
-  if (!userText && toolResults.length === 0) {
-    debugLog("chat.no_user_message", { requestId, messages: body.messages });
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        error: {
-          message: "No user message found",
-          type: "invalid_request_error",
-        },
-      }),
-    );
-    return;
-  }
 
   const sessionId = derivePiSessionId(body);
   const bridgeKey = deriveBridgeKey(body.messages, sessionId);
@@ -2216,6 +2392,7 @@ export function cleanupSessionState(sessionId?: string): void {
   const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
   const convKey = deriveConversationKeyFromSessionId(sessionId);
   const active = activeBridges.get(bridgeKey);
+  const running = active?.bridge ?? sessionBridges.get(bridgeKey);
   debugLog("session.cleanup", {
     sessionId,
     bridgeKey,
@@ -2223,7 +2400,16 @@ export function cleanupSessionState(sessionId?: string): void {
     hasActiveBridge: !!active,
     hadConversation: conversationStates.has(convKey),
   });
-  if (active) cleanupBridge(active.bridge, active.heartbeatTimer, bridgeKey);
+  if (running) {
+    disposedBridges.add(running);
+    const heartbeat = active?.heartbeatTimer ?? bridgeHeartbeats.get(running);
+    if (heartbeat) cleanupBridge(running, heartbeat, bridgeKey);
+    else {
+      try { running.end(); } catch {}
+      try { running.proc.kill(); } catch {}
+      sessionBridges.delete(bridgeKey);
+    }
+  }
   conversationStates.delete(convKey);
 }
 
@@ -2321,58 +2507,6 @@ function createConnectFrameParser(
       else onMessage(messageBytes);
     }
   };
-}
-
-const CONTEXT_OVERFLOW_MSG =
-  "context length exceeded — Cursor rejected the request as too large";
-
-function isContextOverflowMessage(msg: string): boolean {
-  return /context|token|length|overflow|too.?long|too.?large/i.test(msg);
-}
-
-function mapConnectErrorCode(code: string, message: string): string {
-  switch (code) {
-    case "unauthenticated":
-      return "Cursor authentication expired — run /login cursor";
-    case "resource_exhausted":
-      return CONTEXT_OVERFLOW_MSG;
-    case "deadline_exceeded":
-      return "Cursor request timed out server-side — try again";
-    case "unavailable":
-      return "Cursor service unavailable — try again";
-    case "internal":
-      return "Cursor internal error — try again";
-    case "invalid_argument":
-      return isContextOverflowMessage(message) ? CONTEXT_OVERFLOW_MSG : message;
-    default:
-      return message;
-  }
-}
-
-interface ConnectEndStreamError {
-  message: string;
-  retryable: boolean;
-}
-
-const RETRYABLE_CONNECT_CODES = new Set(["internal", "unavailable", "deadline_exceeded"]);
-
-function parseConnectEndStream(data: Uint8Array): ConnectEndStreamError | null {
-  if (data.length === 0) return null;
-  try {
-    const payload = JSON.parse(new TextDecoder().decode(data));
-    const error = payload?.error;
-    if (error) {
-      const code = String(error.code ?? "unknown");
-      const rawMessage = String(error.message ?? "Unknown error");
-      return {
-        message: mapConnectErrorCode(code, rawMessage),
-        retryable: RETRYABLE_CONNECT_CODES.has(code),
-      };
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
 
 function makeHeartbeatBytes(): Uint8Array {
@@ -2536,6 +2670,7 @@ function startBridge(accessToken: string, requestBytes: Uint8Array, bridgeKey: s
   );
   // Don't hold the event loop open between heartbeats.
   heartbeatTimer.unref();
+  bridgeHeartbeats.set(bridge, heartbeatTimer);
   sessionBridges.set(bridgeKey, bridge);
   return { bridge, heartbeatTimer, staleBridgeKilled };
 }
@@ -2596,10 +2731,18 @@ function cleanupBridge(
 ): void {
   debugLog("bridge.cleanup", { bridgeKey, alive: bridge.alive });
   clearInterval(heartbeatTimer);
+  bridgeHeartbeats.delete(bridge);
   if (bridge.alive) {
     sendCancelAction(bridge);
     bridge.end();
-    setTimeout(() => { try { bridge.proc.kill(); } catch {} }, 10_000);
+    if (bridge.alive && !bridgeKillTimers.has(bridge)) {
+      const timer = setTimeout(() => {
+        bridgeKillTimers.delete(bridge);
+        try { bridge.proc.kill(); } catch {}
+      }, 10_000);
+      timer.unref();
+      bridgeKillTimers.set(bridge, timer);
+    }
   }
   if (sessionBridges.get(bridgeKey) === bridge) sessionBridges.delete(bridgeKey);
   activeBridges.delete(bridgeKey);
@@ -2769,6 +2912,7 @@ function writeSSEStream(
 
     const processChunk = createConnectFrameParser(
       (messageBytes) => {
+        if (disposedBridges.has(activeBridge)) return;
         resetStallTimer();
         try {
           const serverMessage = fromBinary(
@@ -2884,6 +3028,7 @@ function writeSSEStream(
         }
       },
       (endStreamBytes) => {
+        if (disposedBridges.has(activeBridge)) return;
         resetStallTimer();
         const endError = parseConnectEndStream(endStreamBytes);
         clearInterval(activeHeartbeatTimer);
@@ -2907,8 +3052,8 @@ function writeSSEStream(
           );
           activeBridge.end();
           activeBridge.unref();
-          sendSSE(makeChunk({ content: endError.message }, "error"));
           sendSSE(makeUsageChunk());
+          sendSSE({ error: { message: endError.message, type: "upstream_error", code: endError.code } });
           sendDone();
           closeResponse();
         } else {
@@ -2944,8 +3089,17 @@ function writeSSEStream(
         retryCount,
       });
       clearInterval(activeHeartbeatTimer);
+      bridgeHeartbeats.delete(activeBridge);
+      clearTimeout(bridgeKillTimers.get(activeBridge));
+      bridgeKillTimers.delete(activeBridge);
       if (stallTimer) clearTimeout(stallTimer);
       if (sessionBridges.get(bridgeKey) === activeBridge) sessionBridges.delete(bridgeKey);
+      if (disposedBridges.has(activeBridge)) {
+        req.removeListener("close", onClientClose);
+        res.removeListener("close", onClientClose);
+        closeResponse();
+        return;
+      }
       const stored = conversationStates.get(convKey);
       if (stored) {
         for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -2969,7 +3123,7 @@ function writeSSEStream(
       // request and replay on a fresh bridge.  The SSE response stays
       // open — the client sees at most a brief pause.
       const shouldRetry = retryableConnectError || code !== 0;
-      if (shouldRetry && !closed && accessToken && retryCount < MAX_BRIDGE_RETRIES) {
+      if (shouldRetry && !contentSent && !closed && accessToken && retryCount < MAX_BRIDGE_RETRIES) {
         const cp = preTurnCheckpoint ?? stored?.checkpoint ?? null;
         // For retryable Connect errors, allow retry even without a
         // checkpoint (first request in session) — buildCursorRequest
@@ -3031,8 +3185,8 @@ function writeSSEStream(
             `[cursor-provider] Bridge exited (code ${code}) before receiving response (${modelId})`,
           );
           const failureMsg = classifyBridgeFailure(code, activeBridge.getStderr());
-          sendSSE(makeChunk({ content: failureMsg }, "error"));
           sendSSE(makeUsageChunk());
+          sendSSE({ error: { message: failureMsg, type: "upstream_error", code: "bridge_terminated" } });
           sendDone();
           closeResponse();
         } else {
@@ -3049,8 +3203,8 @@ function writeSSEStream(
           closeResponse();
         }
       } else if (code !== 0) {
-        sendSSE(makeChunk({ content: "Bridge connection lost" }, "error"));
         sendSSE(makeUsageChunk());
+        sendSSE({ error: { message: "Bridge connection lost", type: "upstream_error", code: "bridge_connection_lost" } });
         sendDone();
         closeResponse();
         activeBridges.delete(bridgeKey);
@@ -3280,6 +3434,7 @@ async function handleNonStreamingResponse(
     bridge.onData(
       createConnectFrameParser(
         (messageBytes) => {
+          if (disposedBridges.has(bridge)) return;
           try {
             const serverMessage = fromBinary(
               AgentServerMessageSchema,
@@ -3353,6 +3508,7 @@ async function handleNonStreamingResponse(
           }
         },
         (endStreamBytes) => {
+          if (disposedBridges.has(bridge)) return;
           const endError = parseConnectEndStream(endStreamBytes);
           // Always unref regardless of error/success.
           clearInterval(heartbeatTimer);
@@ -3381,9 +3537,17 @@ async function handleNonStreamingResponse(
         latestCheckpoint,
       });
       clearInterval(heartbeatTimer);
+      bridgeHeartbeats.delete(bridge);
+      clearTimeout(bridgeKillTimers.get(bridge));
+      bridgeKillTimers.delete(bridge);
       if (sessionBridges.get(bridgeKey) === bridge) sessionBridges.delete(bridgeKey);
       req.removeListener("close", onClientClose);
       res.removeListener("close", onClientClose);
+      if (disposedBridges.has(bridge)) {
+        if (!res.writableEnded && !res.destroyed) res.end();
+        resolve();
+        return;
+      }
       const stored = conversationStates.get(convKey);
       if (stored) {
         for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
@@ -3427,7 +3591,7 @@ async function handleNonStreamingResponse(
             error: {
               message: nonStreamError.message,
               type: "upstream_error",
-              code: "cursor_error",
+              code: nonStreamError.code,
             },
           }),
         );

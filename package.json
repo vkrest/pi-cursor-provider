@@ -1,6 +1,6 @@
 {
   "name": "@offbynan/pi-cursor-provider",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Pi extension providing access to Cursor models via OAuth and a local OpenAI-compatible gRPC proxy",
   "type": "module",
   "license": "MIT",
@@ -23,20 +23,27 @@
     "openai-compatible"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-ai": ">=0.84.0 <1.0.0",
+    "@earendil-works/pi-coding-agent": ">=0.84.0 <1.0.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.19.0"
   },
   "files": [
     "index.ts",
+    "model-ids.ts",
+    "cursor-errors.ts",
+    "secure-log.ts",
     "auth.ts",
     "proxy.ts",
     "h2-bridge.mjs",
     "cursor-models-raw.json",
     "proto/agent_pb.ts",
     "README.md",
+    "CHANGELOG.md",
+    "scripts/debug-log-timeline.mjs",
+    "scripts/refresh-models.mjs",
+    "scripts/smoke-live.mjs",
     "LICENSE"
   ],
   "pi": {
@@ -45,16 +52,25 @@
     ]
   },
   "dependencies": {
-    "@bufbuild/protobuf": "^2.0.0"
+    "@bufbuild/protobuf": "^2.10.2"
   },
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:live": "node scripts/smoke-live.mjs",
     "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run check 1>&2",
+    "prepublishOnly": "npm run check",
     "refresh-models": "node scripts/refresh-models.mjs",
     "debug:timeline": "node scripts/debug-log-timeline.mjs"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.3"
   }

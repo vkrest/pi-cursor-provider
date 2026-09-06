@@ -127,8 +127,8 @@ export async function refreshCursorToken(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Cursor token refresh failed: ${error}`);
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`Cursor token refresh failed (HTTP ${response.status})`);
   }
 
   const data = (await response.json()) as {

@@ -22,6 +22,7 @@ import {
   deriveConversationKeyFromSessionId,
   derivePiSessionId,
   deterministicConversationId,
+  inferContextWindow,
   buildCursorRequest,
   parseMessages,
   setBridgeFactoryForTests,
@@ -250,22 +251,26 @@ describe("buildEffortMap", () => {
       new Set(["none", "low", "medium", "high", "xhigh"]),
     );
     expect(map).toEqual({
+      off: "none",
       minimal: "none",
       low: "low",
       medium: "medium",
       high: "high",
       xhigh: "xhigh",
+      max: null,
     });
   });
 
   test("with default (empty) and medium", () => {
     const map = buildEffortMap(new Set(["", "low", "medium", "high"]));
     expect(map).toEqual({
+      off: "",
       minimal: "low",
       low: "low",
       medium: "medium",
       high: "high",
       xhigh: "high",
+      max: null,
     });
   });
 
@@ -277,11 +282,13 @@ describe("buildEffortMap", () => {
   test("high+max only — all lower levels clamp to high", () => {
     const map = buildEffortMap(new Set(["high", "max"]));
     expect(map).toEqual({
+      off: null,
       minimal: "high",
       low: "high",
       medium: "high",
       high: "high",
       xhigh: "max",
+      max: "max",
     });
   });
 
@@ -290,22 +297,26 @@ describe("buildEffortMap", () => {
       new Set(["none", "low", "medium", "high", "max"]),
     );
     expect(map).toEqual({
+      off: "none",
       minimal: "none",
       low: "low",
       medium: "medium",
       high: "high",
       xhigh: "max",
+      max: "max",
     });
   });
 
   test("low+high — medium falls back to low", () => {
     const map = buildEffortMap(new Set(["low", "high"]));
     expect(map).toEqual({
+      off: null,
       minimal: "low",
       low: "low",
       medium: "low",
       high: "high",
       xhigh: "high",
+      max: null,
     });
   });
 });
@@ -314,12 +325,13 @@ describe("buildThinkingLevelMap", () => {
   test("maps pi thinking levels to cursor effort suffixes", () => {
     const effortMap = buildEffortMap(new Set(["low", "medium", "high"]));
     expect(buildThinkingLevelMap(effortMap)).toEqual({
-      off: "medium",
+      off: null,
       minimal: "low",
       low: "low",
       medium: "medium",
       high: "high",
       xhigh: "high",
+      max: null,
     });
   });
 });
@@ -343,7 +355,7 @@ describe("reasoning support", () => {
       FALLBACK_MODELS.find((model) => model.id === "gpt-5.4-medium")?.reasoning,
     ).toBe(true);
     expect(
-      FALLBACK_MODELS.find((model) => model.id === "composer-2")?.reasoning,
+      FALLBACK_MODELS.find((model) => model.id === "composer-2.5")?.reasoning,
     ).toBe(true);
   });
 });
@@ -395,12 +407,13 @@ describe("processModels", () => {
     expect(result[0]!.supportsEffort).toBe(true);
     expect(supportsReasoningModelId(result[0]!.id)).toBe(true);
     expect(buildThinkingLevelMap(result[0]!.effortMap!)).toEqual({
-      off: "medium",
+      off: null,
       minimal: "low",
       low: "low",
       medium: "medium",
       high: "high",
       xhigh: "high",
+      max: null,
     });
   });
 
@@ -476,6 +489,27 @@ describe("processModels", () => {
     expect(result[0]!.effortMap!.medium).toBe("medium");
   });
 
+  test("Cursor Grok 4.5 variants map effort and speed correctly", () => {
+    const result = processModels([
+      m("cursor-grok-4.5-low", "Cursor Grok 4.5 Low"),
+      m("cursor-grok-4.5-medium", "Cursor Grok 4.5 Medium"),
+      m("cursor-grok-4.5-high", "Cursor Grok 4.5"),
+      m("cursor-grok-4.5-low-fast", "Cursor Grok 4.5 Low Fast"),
+      m("cursor-grok-4.5-medium-fast", "Cursor Grok 4.5 Medium Fast"),
+      m("cursor-grok-4.5-high-fast", "Cursor Grok 4.5 Fast"),
+    ]);
+
+    expect(result.map((model) => model.id)).toEqual([
+      "cursor-grok-4.5",
+      "cursor-grok-4.5-fast",
+    ]);
+    for (const model of result) {
+      expect(model.supportsEffort).toBe(true);
+      expect(model.effortMap).toMatchObject({ low: "low", medium: "medium", high: "high" });
+      expect(supportsReasoningModelId(model.id)).toBe(true);
+    }
+  });
+
   test("composer-2 — single model without effort, NOT deduped", () => {
     const result = processModels([m("composer-2")]);
     expect(result).toHaveLength(1);
@@ -544,9 +578,9 @@ describe("processModels", () => {
     expect(result.length).toBeGreaterThan(20);
 
     // Spot checks
-    const composer2 = result.find((r) => r.id === "composer-2");
-    expect(composer2).toBeDefined();
-    expect(composer2!.supportsEffort).toBe(false);
+    const composer25 = result.find((r) => r.id === "composer-2.5");
+    expect(composer25).toBeDefined();
+    expect(composer25!.supportsEffort).toBe(false);
 
     const gpt54 = result.find((r) => r.id === "gpt-5.4");
     expect(gpt54).toBeDefined();
@@ -555,6 +589,12 @@ describe("processModels", () => {
     const gpt55 = result.find((r) => r.id === "gpt-5.5");
     expect(gpt55).toBeDefined();
     expect(gpt55!.supportsEffort).toBe(true);
+
+    const grok46 = result.find((r) => r.id === "cursor-grok-4.6");
+    const grok46Fast = result.find((r) => r.id === "cursor-grok-4.6-fast");
+    expect(grok46?.supportsEffort).toBe(true);
+    expect(grok46Fast?.supportsEffort).toBe(true);
+    expect(supportsReasoningModelId(grok46!.id)).toBe(true);
 
     // Opus should be deduped too
     const opus46 = result.find((r) => r.id === "claude-4.6-opus");
@@ -571,6 +611,13 @@ describe("processModels", () => {
 });
 
 // ── resolveModelId ──
+
+describe("inferContextWindow", () => {
+  test("uses the Grok 4 window for Cursor-prefixed Grok models", () => {
+    expect(inferContextWindow("cursor-grok-4.5")).toBe(256_000);
+    expect(inferContextWindow("cursor-grok-4.5-high-fast")).toBe(256_000);
+  });
+});
 
 describe("resolveModelId", () => {
   test("no effort — returns model as-is", () => {
@@ -1508,6 +1555,7 @@ function makeMcpExecMessage(
 }
 
 async function postChatCompletion(port: number, body: Record<string, unknown>) {
+  const { getProxyAuthToken } = await import("./proxy.ts");
   return new Promise<{ statusCode: number; body: string }>(
     (resolve, reject) => {
       const req = httpRequest(
@@ -1516,7 +1564,10 @@ async function postChatCompletion(port: number, body: Record<string, unknown>) {
           port,
           path: "/v1/chat/completions",
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${getProxyAuthToken()}`,
+          },
         },
         (res) => {
           let data = "";
@@ -2354,6 +2405,7 @@ describe("process exit safety (pi -p)", () => {
 
     const port = await startProxy(async () => "test-token");
 
+    const { getProxyAuthToken } = await import("./proxy.ts");
     const result = await new Promise<{
       connectionHeader: string | undefined;
       socketDestroyed: boolean;
@@ -2364,7 +2416,10 @@ describe("process exit safety (pi -p)", () => {
           port,
           path: "/v1/chat/completions",
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${getProxyAuthToken()}`,
+          },
         },
         (res) => {
           const connectionHeader = res.headers["connection"] as
